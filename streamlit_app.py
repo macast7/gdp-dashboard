@@ -1,120 +1,120 @@
-import io
+import json
+from io import StringIO
 from pathlib import Path
-from typing import Dict, Set, List
 
+import nltk
 import pandas as pd
 import streamlit as st
 
-###############################################################################
-# Streamlit – Marketing Keyword Classifier                                   #
-###############################################################################
-st.set_page_config(page_title="Marketing Keyword Classifier", layout="wide")
-st.title("📈 Marketing Keyword Classifier")
+# Ensure the Punkt tokenizer is available (suppresses download log noise)
+nltk.download("punkt", quiet=True)
 
-# ---------------------------------------------------------------------------
-# 🛠️ Sidebar – Upload & Configuration
-# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Instagram Caption Pre‑processor", page_icon="📸", layout="centered")
+
+st.title("📸 Instagram Caption Pre‑processor")
+st.markdown(
+    """
+Transform your raw Instagram post data into a sentence‑level CSV that’s ready for downstream analysis. 
+
+**How it works**
+1. Upload a CSV containing `shortcode` and `caption` columns (the defaults expected by CrowdTangle exports).
+2. (Optional) Adjust the column‑renaming dictionary if your CSV uses different names.
+3. Download the transformed file—each sentence gets its own row with incremental sentence IDs.
+"""
+)
+
+# --- Sidebar: dictionary controls ------------------------------------------------------
 with st.sidebar:
-    st.header("🗂️ 1. Upload Your CSV")
-    uploaded_file = st.file_uploader("CSV file with a 'Statement' column", type=["csv"])
+    st.header("⚙️ Rename Columns")
+    st.write("Modify the mapping if your CSV uses different column names.")
 
-    st.markdown("---")
-    st.header("🔧 2. Configure Dictionaries")
+    DEFAULT_MAPPING = {"shortcode": "ID", "caption": "Context"}
 
-    # Default marketing keyword dictionaries
-    default_dicts: Dict[str, Set[str]] = {
-        "urgency_marketing": {
-            "limited", "limited time", "limited run", "limited edition", "order now",
-            "last chance", "hurry", "while supplies last", "before they're gone",
-            "selling out", "selling fast", "act now", "don't wait", "today only",
-            "expires soon", "final hours", "almost gone",
-        },
-        "exclusive_marketing": {
-            "exclusive", "exclusively", "exclusive offer", "exclusive deal",
-            "members only", "vip", "special access", "invitation only",
-            "premium", "privileged", "limited access", "select customers",
-            "insider", "private sale", "early access",
-        },
-    }
-
-    # Load edited or new dictionaries into this object
-    current_dicts: Dict[str, Set[str]] = {}
-
-    for label, keywords in default_dicts.items():
-        kw_text = "\n".join(sorted(keywords))
-        new_kw_text = st.text_area(
-            f"Keywords for **{label}** (one per line)", kw_text, key=label
-        )
-        kw_set = {kw.strip().lower() for kw in new_kw_text.split("\n") if kw.strip()}
-        if kw_set:
-            current_dicts[label] = kw_set
-
-    # Section to add a completely new category
-    st.markdown("---")
-    st.subheader("➕ Add New Category")
-    new_label = st.text_input("New category name (alphanumeric and underscores)")
-    new_kw_input = st.text_area("Keywords for new category (one per line)")
-    if new_label and new_kw_input:
-        new_kw_set = {kw.strip().lower() for kw in new_kw_input.split("\n") if kw.strip()}
-        if new_kw_set:
-            current_dicts[new_label.strip().lower()] = new_kw_set
-
-    st.markdown("---")
-    one_hot = st.checkbox("Add one‑hot encoded columns", value=True)
-
-###############################################################################
-# Helper – Classification Function
-###############################################################################
-
-def classify_statement(text: str, dictionaries: Dict[str, Set[str]]) -> List[str]:
-    """Return list of dictionary names whose keywords appear in *text*."""
-    text_lower = text.lower()
-    matched: List[str] = []
-    for label, keywords in dictionaries.items():
-        if any(kw in text_lower for kw in keywords):
-            matched.append(label)
-    return matched
-
-###############################################################################
-# 🚀 Main – Run Classification & Display Results
-###############################################################################
-
-def run_classifier(file_buffer: io.BytesIO, dictionaries: Dict[str, Set[str]]):
-    df = pd.read_csv(file_buffer)
-
-    if "Statement" not in df.columns:
-        st.error("❌ The uploaded CSV must contain a column named 'Statement'.")
-        return
-
-    # Classify
-    with st.spinner("Classifying statements…"):
-        df["labels"] = df["Statement"].astype(str).apply(classify_statement, dictionaries=dictionaries)
-        if one_hot:
-            for label in dictionaries:
-                df[label] = df["labels"].apply(lambda cats, lbl=label: lbl in cats)
-
-    st.success("✅ Classification complete!")
-
-    # Preview
-    st.subheader("🔍 Preview (first 10 rows)")
-    st.dataframe(df.head(10), use_container_width=True)
-
-    # Download
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download classified CSV",
-        data=csv_bytes,
-        file_name="classified_output.csv",
-        mime="text/csv",
+    mapping_str = st.text_area(
+        "Column mapping (JSON)",
+        value=json.dumps(DEFAULT_MAPPING, indent=2),
+        height=120,
+        help="Keys are your source column names; values are the desired output names.",
     )
 
-###############################################################################
-# 🏁 App Execution
-###############################################################################
-if uploaded_file is not None:
+    # Parse mapping safely
     try:
-        run_classifier(uploaded_file, current_dicts)
+        rename_dict = json.loads(mapping_str)
+        if not isinstance(rename_dict, dict):
+            st.warning("Mapping must be a JSON object/dictionary. Reverting to default.")
+            rename_dict = DEFAULT_MAPPING
+    except json.JSONDecodeError as e:
+        st.warning(f"Invalid JSON: {e}. Reverting to default mapping.")
+        rename_dict = DEFAULT_MAPPING
+
+    st.write("Current mapping:")
+    st.code(json.dumps(rename_dict, indent=2), language="json")
+
+# --- Utility functions ----------------------------------------------------------------
+
+def sentence_tokenize(text: str):
+    """Return a clean list of sentences for a single caption."""
+    if pd.isna(text):
+        return []
+    # Normalise fancy apostrophes so they don't split words unexpectedly
+    text = text.replace("’", "'")
+    return [s.strip() for s in nltk.sent_tokenize(text) if s.strip()]
+
+
+def transform(df_raw: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    """Rename columns according to mapping and explode captions into sentences."""
+    # Validate required columns
+    missing = [col for col in mapping.keys() if col not in df_raw.columns]
+    if missing:
+        raise ValueError(f"Missing required column(s) in uploaded file: {', '.join(missing)}")
+
+    df = df_raw.rename(columns=mapping)
+
+    records = []
+    for _, row in df.iterrows():
+        for idx, sent in enumerate(sentence_tokenize(row[mapping.get('caption', 'Context')]), start=1):
+            records.append({
+                mapping.get('shortcode', 'ID'): row[mapping.get('shortcode', 'ID')],
+                "Sentence ID": idx,
+                mapping.get('caption', 'Context'): row[mapping.get('caption', 'Context')],
+                "Statement": sent,
+            })
+    return pd.DataFrame(records)
+
+# --- Main layout ----------------------------------------------------------------------
+
+uploaded_file = st.file_uploader("Upload CSV", type="csv")
+
+if uploaded_file:
+    try:
+        df_raw = pd.read_csv(uploaded_file)
+        st.success(f"Loaded {len(df_raw):,} rows from {uploaded_file.name}")
+
+        with st.expander("Preview raw data"):
+            st.dataframe(df_raw.head())
+
+        # Perform transformation
+        try:
+            df_out = transform(df_raw, rename_dict)
+        except Exception as e:
+            st.error(f"❌ Transformation failed: {e}")
+        else:
+            st.subheader("🔍 Transformed Data Preview")
+            st.dataframe(df_out.head())
+            st.info(f"Transformation produced {len(df_out):,} rows.")
+
+            # Offer download
+            csv_buffer = StringIO()
+            df_out.to_csv(csv_buffer, index=False)
+            st.download_button(
+                label="💾 Download transformed CSV",
+                data=csv_buffer.getvalue(),
+                file_name=f"{Path(uploaded_file.name).stem}_transformed.csv",
+                mime="text/csv",
+            )
+
     except Exception as e:
-        st.exception(e)
+        st.error(f"❌ Could not read CSV: {e}")
 else:
-    st.info("👆 Upload a CSV file to get started.")
+    st.info("👆 Upload a CSV file to begin.")
+
