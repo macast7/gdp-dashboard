@@ -22,7 +22,7 @@ def guess_id_columns(df: pd.DataFrame) -> List[str]:
     candidates = []
     
     for col in df.columns:
-        col_lower = col.lower()
+        col_lower = str(col).lower()
         if any(keyword in col_lower for keyword in id_keywords):
             candidates.append(col)
     
@@ -35,7 +35,7 @@ def guess_text_columns(df: pd.DataFrame) -> List[str]:
     candidates = []
     
     for col in df.columns:
-        col_lower = col.lower()
+        col_lower = str(col).lower()
         if any(keyword in col_lower for keyword in text_keywords):
             candidates.append(col)
     
@@ -118,33 +118,46 @@ def transform_data(df: pd.DataFrame, id_col: str, text_col: str, include_hashtag
     """Transform data into sentence-level format."""
     results = []
     
+    # Validate columns exist
+    if id_col not in df.columns:
+        st.error(f"ID column '{id_col}' not found in data. Available columns: {list(df.columns)}")
+        return pd.DataFrame()
+    
+    if text_col not in df.columns:
+        st.error(f"Text column '{text_col}' not found in data. Available columns: {list(df.columns)}")
+        return pd.DataFrame()
+    
     for idx, row in df.iterrows():
-        record_id = row[id_col]
-        text = row[text_col]
-        
-        if pd.isna(text):
+        try:
+            record_id = row[id_col]
+            text = row[text_col]
+            
+            if pd.isna(text):
+                continue
+            
+            # Clean text for sentence splitting
+            cleaned_text = clean_text(text)
+            
+            # Split into sentences
+            sentences = split_into_sentences(cleaned_text, use_nltk=True)
+            
+            # Add hashtags as separate sentence if requested
+            if include_hashtags:
+                hashtags = extract_hashtags(str(text))
+                if hashtags:
+                    sentences.append(hashtags)
+            
+            # Create output rows
+            for sent_idx, sentence in enumerate(sentences, 1):
+                results.append({
+                    'ID': record_id,
+                    'Sentence_ID': sent_idx,
+                    'Context': str(text)[:200] + '...' if len(str(text)) > 200 else str(text),
+                    'Statement': sentence
+                })
+        except Exception as e:
+            st.warning(f"Error processing row {idx}: {str(e)}")
             continue
-        
-        # Clean text for sentence splitting
-        cleaned_text = clean_text(text)
-        
-        # Split into sentences
-        sentences = split_into_sentences(cleaned_text, use_nltk=True)
-        
-        # Add hashtags as separate sentence if requested
-        if include_hashtags:
-            hashtags = extract_hashtags(str(text))
-            if hashtags:
-                sentences.append(hashtags)
-        
-        # Create output rows
-        for sent_idx, sentence in enumerate(sentences, 1):
-            results.append({
-                'ID': record_id,
-                'Sentence_ID': sent_idx,
-                'Context': str(text)[:200] + '...' if len(str(text)) > 200 else str(text),
-                'Statement': sentence
-            })
     
     return pd.DataFrame(results)
 
@@ -154,13 +167,21 @@ def create_column_info(df: pd.DataFrame) -> pd.DataFrame:
     info_data = []
     
     for col in df.columns:
-        sample_val = df[col].dropna().iloc[0] if not df[col].dropna().empty else "N/A"
-        info_data.append({
-            'Column': col,
-            'dtype': str(df[col].dtype),
-            'non_null_count': df[col].notna().sum(),
-            'sample_value': str(sample_val)[:50] + '...' if len(str(sample_val)) > 50 else str(sample_val)
-        })
+        try:
+            sample_val = df[col].dropna().iloc[0] if not df[col].dropna().empty else "N/A"
+            info_data.append({
+                'Column': str(col),
+                'dtype': str(df[col].dtype),
+                'non_null_count': int(df[col].notna().sum()),
+                'sample_value': str(sample_val)[:50] + '...' if len(str(sample_val)) > 50 else str(sample_val)
+            })
+        except Exception as e:
+            info_data.append({
+                'Column': str(col),
+                'dtype': 'error',
+                'non_null_count': 0,
+                'sample_value': f'Error: {str(e)}'
+            })
     
     return pd.DataFrame(info_data)
 
@@ -185,11 +206,14 @@ def main():
             # Load data
             df = pd.read_csv(uploaded_file)
             
+            # Debug info
+            st.write(f"**Debug Info:** Columns found: {list(df.columns)}")
+            
             st.success(f"✅ Loaded {len(df)} rows and {len(df.columns)} columns")
             
             # Data preview
             st.subheader("📊 Data Preview")
-            preview_rows = st.number_input("Number of rows to preview", min_value=1, max_value=1000, value=500)
+            preview_rows = st.number_input("Number of rows to preview", min_value=1, max_value=1000, value=min(500, len(df)))
             st.dataframe(df.head(preview_rows), use_container_width=True)
             
             # Column information
@@ -205,63 +229,96 @@ def main():
             text_candidates = guess_text_columns(df)
             
             # Column selection
+            all_columns = df.columns.tolist()
+            
+            # Default selections
+            default_id_idx = 0
+            if id_candidates:
+                try:
+                    default_id_idx = all_columns.index(id_candidates[0])
+                except ValueError:
+                    default_id_idx = 0
+            
+            default_text_idx = min(1, len(all_columns) - 1)  # Second column or last if only one
+            if text_candidates:
+                try:
+                    default_text_idx = all_columns.index(text_candidates[0])
+                except ValueError:
+                    default_text_idx = min(1, len(all_columns) - 1)
+            
             id_col = st.sidebar.selectbox(
                 "Select ID Column",
-                options=df.columns.tolist(),
-                index=df.columns.tolist().index(id_candidates[0]) if id_candidates else 0
+                options=all_columns,
+                index=default_id_idx,
+                help="Column containing unique identifiers"
             )
             
             text_col = st.sidebar.selectbox(
                 "Select Text Column",
-                options=df.columns.tolist(),
-                index=df.columns.tolist().index(text_candidates[0]) if text_candidates else 0
+                options=all_columns,
+                index=default_text_idx,
+                help="Column containing text to split into sentences"
             )
             
             include_hashtags = st.sidebar.checkbox("Include hashtags as separate sentences", value=True)
             
+            # Show selected columns info
+            st.sidebar.write(f"**Selected ID Column:** {id_col}")
+            st.sidebar.write(f"**Selected Text Column:** {text_col}")
+            
             # Transform button
             if st.sidebar.button("🚀 Transform Data", type="primary"):
-                with st.spinner("Transforming data..."):
-                    transformed_df = transform_data(df, id_col, text_col, include_hashtags)
-                
-                if not transformed_df.empty:
-                    st.subheader("✨ Transformed Data")
-                    
-                    # Display first 20 rows
-                    st.dataframe(transformed_df.head(20), use_container_width=True)
-                    
-                    # KPI metrics
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.metric("Original Rows", len(df))
-                    
-                    with col2:
-                        st.metric("Generated Sentences", len(transformed_df))
-                    
-                    with col3:
-                        avg_sentences = len(transformed_df) / len(df) if len(df) > 0 else 0
-                        st.metric("Avg Sentences/Record", f"{avg_sentences:.2f}")
-                    
-                    # Download button
-                    csv_buffer = io.StringIO()
-                    transformed_df.to_csv(csv_buffer, index=False)
-                    csv_data = csv_buffer.getvalue()
-                    
-                    st.download_button(
-                        label="📥 Download Transformed CSV",
-                        data=csv_data,
-                        file_name="transformed_data.csv",
-                        mime="text/csv"
-                    )
+                if id_col == text_col:
+                    st.error("Please select different columns for ID and Text.")
                 else:
-                    st.warning("No sentences generated. Please check your data and column selections.")
+                    with st.spinner("Transforming data..."):
+                        transformed_df = transform_data(df, id_col, text_col, include_hashtags)
+                    
+                    if not transformed_df.empty:
+                        st.subheader("✨ Transformed Data")
+                        
+                        # Display first 20 rows
+                        st.dataframe(transformed_df.head(20), use_container_width=True)
+                        
+                        # KPI metrics
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.metric("Original Rows", len(df))
+                        
+                        with col2:
+                            st.metric("Generated Sentences", len(transformed_df))
+                        
+                        with col3:
+                            avg_sentences = len(transformed_df) / len(df) if len(df) > 0 else 0
+                            st.metric("Avg Sentences/Record", f"{avg_sentences:.2f}")
+                        
+                        # Download button
+                        csv_buffer = io.StringIO()
+                        transformed_df.to_csv(csv_buffer, index=False)
+                        csv_data = csv_buffer.getvalue()
+                        
+                        st.download_button(
+                            label="📥 Download Transformed CSV",
+                            data=csv_data,
+                            file_name="transformed_data.csv",
+                            mime="text/csv"
+                        )
+                    else:
+                        st.warning("No sentences generated. Please check your data and column selections.")
         
         except Exception as e:
             st.error(f"Error processing file: {str(e)}")
+            st.write("**Debug Info:** Please check that your CSV file is properly formatted.")
     
     else:
         st.info("👆 Please upload a CSV file to get started")
+        st.markdown("""
+        ### Expected CSV Format:
+        - Should have at least 2 columns
+        - One column for IDs (e.g., 'id', 'post_id', 'user_id')
+        - One column for text content (e.g., 'text', 'content', 'message')
+        """)
 
 
 if __name__ == "__main__":
