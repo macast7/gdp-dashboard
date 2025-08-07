@@ -1,313 +1,237 @@
-import streamlit as st
-import pandas as pd
+import os
 import json
 import re
-from typing import List, Dict, Any
-import anthropic
+import datetime as dt
 from io import StringIO
 
-# Try to import st_tags, fall back to multiselect if not available
-try:
-    from st_tags import st_tags
-    TAGS_AVAILABLE = True
-except ImportError:
-    TAGS_AVAILABLE = False
-    st.warning("st_tags not available. Using multiselect as fallback.")
+import streamlit as st
+import pandas as pd
+import requests
 
-def setup_page():
-    """Configure the Streamlit page"""
-    st.set_page_config(
-        page_title="Dictionary Refinement",
-        page_icon="📚",
-        layout="wide",
-        initial_sidebar_state="expanded"
+# ------------------------------
+# CONFIGURATION
+# ------------------------------
+# Expect the Anthropic API key as an env var. You can rename the env var if you prefer.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL   = "claude-sonnet-4-20250514"
+
+st.set_page_config(
+    page_title="Dictionary Refinement",
+    page_icon="📖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ------------------------------
+# SESSION STATE INITIALISATION
+# ------------------------------
+if "keywords" not in st.session_state:
+    st.session_state.keywords = []  # list[str]
+if "uploaded_df" not in st.session_state:
+    st.session_state.uploaded_df = None  # pd.DataFrame | None
+if "preview_df" not in st.session_state:
+    st.session_state.preview_df = pd.DataFrame()
+
+# ------------------------------
+# HELPER FUNCTIONS
+# ------------------------------
+
+def call_anthropic(prompt: str, max_tokens: int = 1000):
+    """Call the Anthropic Messages API and return text content."""
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("Missing ANTHROPIC_API_KEY env var")
+
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    r.raise_for_status()
+    ans = r.json()
+    # Anthropic returns a list in "content" field
+    text = ans["content"][0]["text"] if isinstance(ans.get("content"), list) else ans.get("content", "")
+    return text.strip()
+
+
+def generate_keywords(definition: str) -> list[str]:
+    prompt = (
+        f"Generate 30 one-word (unigram) keywords that signal the following tactic: {definition}.\n\n"
+        "Return as a JSON array of strings. Focus on words that would clearly indicate this tactic when found in text.\n\n"
+        "Example format: [\"word1\", \"word2\", \"word3\", ...]\n\n"
+        "IMPORTANT: Your entire response must be a single, valid JSON array. Do not include any text outside of the JSON structure."
     )
-    
-    st.title("📚 Dictionary Refinement")
-    st.markdown("Craft high-quality keyword lists with AI assistance")
+    raw = call_anthropic(prompt)
+    # Clean common formatting issues (backticks, triple‑code fences, etc.)
+    cleaned = re.sub(r"```json|```", "", raw).strip()
+    keywords = json.loads(cleaned)
+    # normalise: lower‑case & strip
+    return sorted({kw.strip().lower() for kw in keywords if kw.strip()})
 
-def get_anthropic_client():
-    """Initialize Anthropic client"""
-    # Check if API key is in secrets or environment
-    api_key = None
-    
-    # Try to get from Streamlit secrets first
-    try:
-        api_key = st.secrets["ANTHROPIC_API_KEY"]
-    except:
-        # If not in secrets, ask user to input it
-        if "anthropic_api_key" not in st.session_state:
-            st.session_state.anthropic_api_key = ""
-        
-        with st.sidebar:
-            api_key = st.text_input(
-                "Anthropic API Key",
-                type="password",
-                value=st.session_state.anthropic_api_key,
-                help="Enter your Anthropic API key to generate keyword suggestions"
-            )
-            st.session_state.anthropic_api_key = api_key
-    
-    if not api_key:
-        return None
-    
-    return anthropic.Anthropic(api_key=api_key)
 
-def generate_keywords(tactic_definition: str, client: anthropic.Anthropic) -> List[str]:
-    """Generate keywords using Anthropic Claude API"""
-    prompt = f"""Generate 30 one-word (unigram) keywords that signal the following tactic: {tactic_definition}.
+def parse_csv(file_bytes: bytes) -> pd.DataFrame:
+    """Load CSV bytes into DataFrame and validate required columns."""
+    df = pd.read_csv(StringIO(file_bytes.decode("utf-8")))
+    required = {"ID", "Statement"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(missing)}")
+    return df
 
-Return as a JSON array of strings. Focus on words that would clearly indicate this tactic when found in text.
 
-Example format: ["word1", "word2", "word3", ...]"""
+def find_matches(df: pd.DataFrame, kw: list[str]) -> pd.DataFrame:
+    if df is None or not kw:
+        return pd.DataFrame()
+    pattern = re.compile(r"\\b(" + "|".join(re.escape(k) for k in kw) + r")\\b", re.IGNORECASE)
 
-    try:
-        message = client.messages.create(
-            model="claude-3-sonnet-20240229",
-            max_tokens=1000,
-            temperature=0.7,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
-        
-        # Extract JSON from response
-        response_text = message.content[0].text
-        
-        # Try to find JSON array in the response
-        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        if json_match:
-            keywords_json = json_match.group()
-            keywords = json.loads(keywords_json)
-            return [str(word).strip().lower() for word in keywords if word.strip()]
-        else:
-            st.error("Could not parse keywords from API response")
-            return []
-    
-    except Exception as e:
-        st.error(f"Error generating keywords: {str(e)}")
-        return []
+    def _extract(statement: str):
+        found = pattern.findall(statement or "")
+        found = [f.lower() for f in found]
+        uniq  = sorted(set(found))
+        return uniq, len(uniq)
 
-def display_keywords_editor(keywords: List[str]) -> List[str]:
-    """Display editable keyword interface"""
-    if TAGS_AVAILABLE:
-        # Use st_tags for better UX
-        edited_keywords = st_tags(
-            label="Edit Keywords",
-            text="Press enter to add a keyword",
-            value=keywords,
-            suggestions=[],
-            maxtags=-1,
-            key="keyword_tags"
-        )
-    else:
-        # Fallback to multiselect with text input
-        st.subheader("Edit Keywords")
-        
-        # Display current keywords as chips
-        if keywords:
-            cols = st.columns(min(len(keywords), 5))
-            for i, keyword in enumerate(keywords):
-                with cols[i % 5]:
-                    if st.button(f"❌ {keyword}", key=f"remove_{keyword}_{i}"):
-                        keywords.remove(keyword)
-                        st.rerun()
-        
-        # Input for new keywords
-        new_keyword = st.text_input("Add new keyword:", key="new_keyword_input")
-        if st.button("Add Keyword") and new_keyword.strip():
-            if new_keyword.strip().lower() not in [k.lower() for k in keywords]:
-                keywords.append(new_keyword.strip().lower())
-                st.rerun()
-        
-        edited_keywords = keywords
-    
-    return edited_keywords
-
-def preview_sample_hits(keywords: List[str], df: pd.DataFrame) -> None:
-    """Preview how keywords match against sample CSV"""
-    if df is None or df.empty:
-        st.warning("No CSV file uploaded for preview")
-        return
-    
-    if 'Statement' not in df.columns:
-        st.error("CSV must contain a 'Statement' column")
-        return
-    
-    # Create regex pattern for keyword matching
-    keyword_pattern = r'\b(' + '|'.join(re.escape(k) for k in keywords) + r')\b'
-    
-    # Find matches
-    matches = []
-    for idx, row in df.iterrows():
-        statement = str(row.get('Statement', ''))
-        found_keywords = re.findall(keyword_pattern, statement, re.IGNORECASE)
-        
-        if found_keywords:
-            matches.append({
-                'ID': row.get('ID', idx),
-                'Statement': statement,
-                'Matched_Keywords': list(set([k.lower() for k in found_keywords])),
-                'Match_Count': len(set([k.lower() for k in found_keywords]))
+    results = []
+    for _, row in df.iterrows():
+        uniq, cnt = _extract(str(row["Statement"]))
+        if cnt > 0:
+            results.append({
+                "ID": row.get("ID"),
+                "Statement": row.get("Statement"),
+                "MatchedKeywords": ", ".join(uniq),
+                "Count": cnt,
             })
-    
-    if matches:
-        st.success(f"Found {len(matches)} statements with keyword matches")
-        
-        # Show first 10 matches
-        preview_df = pd.DataFrame(matches[:10])
-        st.dataframe(
-            preview_df,
-            use_container_width=True,
-            column_config={
-                "Statement": st.column_config.TextColumn(width="large"),
-                "Matched_Keywords": st.column_config.ListColumn(),
-                "Match_Count": st.column_config.NumberColumn()
-            }
-        )
-        
-        if len(matches) > 10:
-            st.info(f"Showing first 10 of {len(matches)} matches")
-    else:
-        st.warning("No matches found in the sample data")
+    return pd.DataFrame(results)
 
-def download_dictionary(keywords: List[str]) -> None:
-    """Create download button for dictionary"""
-    if keywords:
-        dictionary_data = {
-            "keywords": keywords,
-            "count": len(keywords),
-            "created_at": pd.Timestamp.now().isoformat()
-        }
-        
-        json_str = json.dumps(dictionary_data, indent=2)
-        
-        st.download_button(
-            label="📥 Download Dictionary",
-            data=json_str,
-            file_name="dictionary.json",
-            mime="application/json",
-            help="Download your refined keyword dictionary as JSON"
-        )
-    else:
-        st.warning("No keywords to download")
+# ------------------------------
+# UI LAYOUT
+# ------------------------------
+# Sidebar – Configuration
+st.sidebar.header("🎯 Configuration")
 
-def main():
-    """Main application logic"""
-    setup_page()
-    
-    # Initialize session state
-    if "keywords" not in st.session_state:
-        st.session_state.keywords = []
-    if "uploaded_df" not in st.session_state:
-        st.session_state.uploaded_df = None
-    
-    # Sidebar
-    with st.sidebar:
-        st.header("📋 Configuration")
-        
-        # Tactic definition input
-        tactic_definition = st.text_input(
-            "Tactic Definition",
-            placeholder="Enter the tactic you want to create keywords for...",
-            help="Describe the tactic or concept you want to identify in text"
-        )
-        
-        # File uploader
-        uploaded_file = st.file_uploader(
-            "Upload Sample CSV",
-            type=['csv'],
-            help="Upload a CSV file with 'ID' and 'Statement' columns"
-        )
-        
-        # Process uploaded file
-        if uploaded_file is not None:
-            try:
-                df = pd.read_csv(uploaded_file)
-                st.session_state.uploaded_df = df
-                
-                # Validate columns
-                required_cols = ['ID', 'Statement']
-                missing_cols = [col for col in required_cols if col not in df.columns]
-                
-                if missing_cols:
-                    st.error(f"Missing columns: {missing_cols}")
-                    st.info("Required columns: ID, Statement")
-                else:
-                    st.success(f"✅ CSV loaded: {len(df)} rows")
-                    with st.expander("Preview Data"):
-                        st.dataframe(df.head(3))
-                        
-            except Exception as e:
-                st.error(f"Error loading CSV: {str(e)}")
-        
-        # Generate button
-        generate_button = st.button(
-            "🎯 Generate Keyword Suggestions",
-            type="primary",
-            disabled=not tactic_definition.strip()
-        )
-    
-    # Main panel
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        # Generate keywords
-        if generate_button:
-            if not tactic_definition.strip():
-                st.error("Please enter a tactic definition")
-                return
-            
-            client = get_anthropic_client()
-            if not client:
-                st.error("Please provide your Anthropic API key in the sidebar")
-                return
-            
-            with st.spinner("Generating keyword suggestions..."):
-                new_keywords = generate_keywords(tactic_definition, client)
-                if new_keywords:
-                    st.session_state.keywords = new_keywords
-                    st.success(f"Generated {len(new_keywords)} keywords!")
-        
-        # Display current tactic if keywords exist
-        if st.session_state.keywords and tactic_definition:
-            st.info(f"**Current Tactic:** {tactic_definition}")
-        
-        # Keywords editor
-        if st.session_state.keywords:
-            st.subheader("🏷️ Keyword Editor")
-            edited_keywords = display_keywords_editor(st.session_state.keywords)
-            st.session_state.keywords = edited_keywords
-            
-            st.info(f"Current dictionary contains {len(edited_keywords)} keywords")
+tactic_def = st.sidebar.text_area(
+    "Tactic Definition", value="", height=120,
+    placeholder="Enter the tactic you want to create keywords for…",
+)
+
+col_gk, col_prev, col_dl = st.sidebar.columns(3)
+
+with col_gk:
+    if st.button("🔮 Generate", use_container_width=True, disabled=not tactic_def.strip()):
+        try:
+            with st.spinner("Calling Anthropic…"):
+                st.session_state.keywords = generate_keywords(tactic_def)
+            st.success(f"Generated {len(st.session_state.keywords)} keywords ✅")
+        except Exception as e:
+            st.error(f"Keyword generation failed: {e}")
+
+with col_prev:
+    prev_disabled = not (st.session_state.keywords and st.session_state.uploaded_df is not None)
+    if st.button("🔍 Preview", use_container_width=True, disabled=prev_disabled):
+        st.session_state.preview_df = find_matches(
+            st.session_state.uploaded_df, st.session_state.keywords
+        ).head(10)
+        if not st.session_state.preview_df.empty:
+            st.success(f"Found {len(st.session_state.preview_df)} sample matches")
         else:
-            st.info("👆 Enter a tactic definition and click 'Generate Keyword Suggestions' to get started")
-    
-    with col2:
-        st.subheader("📊 Actions")
-        
-        # Download dictionary
-        if st.session_state.keywords:
-            download_dictionary(st.session_state.keywords)
-        
-        # Preview sample hits
-        if st.button("🔍 Preview Sample Hits", disabled=not st.session_state.keywords):
-            if st.session_state.keywords:
-                with st.spinner("Analyzing sample data..."):
-                    preview_sample_hits(st.session_state.keywords, st.session_state.uploaded_df)
-        
-        # Statistics
-        if st.session_state.keywords:
-            st.subheader("📈 Statistics")
-            st.metric("Keywords", len(st.session_state.keywords))
-            
-            if st.session_state.uploaded_df is not None:
-                st.metric("Sample Rows", len(st.session_state.uploaded_df))
-    
-    # Preview section (if requested)
-    if st.session_state.get('show_preview', False):
-        st.subheader("🎯 Sample Matches")
-        preview_sample_hits(st.session_state.keywords, st.session_state.uploaded_df)
+            st.info("No matches found in sample data")
 
-if __name__ == "__main__":
-    main()
+with col_dl:
+    if st.session_state.keywords:
+        dict_data = {
+            "keywords": st.session_state.keywords,
+            "count": len(st.session_state.keywords),
+            "created_at": dt.datetime.utcnow().isoformat(),
+            "tactic": tactic_def.strip(),
+        }
+        json_bytes = json.dumps(dict_data, indent=2).encode("utf-8")
+        st.download_button(
+            "⬇️ Download", data=json_bytes, file_name="dictionary.json", mime="application/json",
+            use_container_width=True,
+        )
+    else:
+        st.button("⬇️ Download", use_container_width=True, disabled=True)
+
+# File uploader
+uploaded_file = st.sidebar.file_uploader("Upload Sample CSV (ID, Statement columns)", type="csv")
+if uploaded_file is not None:
+    try:
+        df = parse_csv(uploaded_file.read())
+        st.session_state.uploaded_df = df
+        st.sidebar.success(f"Loaded {len(df)} rows ✅")
+    except Exception as e:
+        st.session_state.uploaded_df = None
+        st.sidebar.error(f"Error parsing CSV: {e}")
+
+st.sidebar.markdown("---")
+st.sidebar.write("Made with ❤️ in Streamlit")
+
+# ------------------------------
+# MAIN PANEL
+# ------------------------------
+
+st.title("📖 Dictionary Refinement")
+st.caption("Craft high‑quality keyword lists with AI assistance.")
+
+# Show tactic definition summary
+if tactic_def.strip() and st.session_state.keywords:
+    with st.expander("Current Tactic Definition", expanded=True):
+        st.markdown(f"**{tactic_def.strip()}**")
+
+# Keyword Editor
+st.subheader("🏷️ Keyword Editor")
+
+kw_col1, kw_col2 = st.columns([3, 1])
+with kw_col1:
+    new_kw = st.text_input("Add new keyword", placeholder="Type a keyword and hit Enter")
+    if new_kw:
+        norm = new_kw.strip().lower()
+        if norm and norm not in st.session_state.keywords:
+            st.session_state.keywords.append(norm)
+            st.session_state.keywords.sort()
+            st.success(f"Added '{norm}' to dictionary")
+with kw_col2:
+    if st.button("➕ Add", disabled=not new_kw):
+        pass  # handled above automatically on text input
+
+if st.session_state.keywords:
+    # Display as chips with remove buttons
+    cols = st.columns(6)
+    for i, kw in enumerate(st.session_state.keywords):
+        with cols[i % 6]:
+            remove = st.button("❌", key=f"rm_{kw}")
+            st.write(kw)
+        if remove:
+            st.session_state.keywords.remove(kw)
+            st.experimental_rerun()
+    st.info(f"Dictionary contains **{len(st.session_state.keywords)}** keywords.")
+else:
+    st.warning("No keywords yet – generate or add manually.")
+
+# Statistics
+if st.session_state.keywords or st.session_state.uploaded_df is not None:
+    st.subheader("📊 Statistics")
+    stat1, stat2 = st.columns(2)
+    stat1.metric("Keywords", f"{len(st.session_state.keywords)}")
+    n_rows = len(st.session_state.uploaded_df) if st.session_state.uploaded_df is not None else 0
+    stat2.metric("Sample Rows", f"{n_rows}")
+
+# Preview Results
+if not st.session_state.preview_df.empty:
+    st.subheader("🎯 Sample Matches (first 10)")
+    st.dataframe(st.session_state.preview_df, hide_index=True, use_container_width=True)
+
+    total_matches = find_matches(
+        st.session_state.uploaded_df, st.session_state.keywords
+    ) if st.session_state.uploaded_df is not None else pd.DataFrame()
+
+    if not total_matches.empty and len(total_matches) > len(st.session_state.preview_df):
+        st.caption(f"Showing first 10 of {len(total_matches)} total matches.")
+
+# End of app
+
